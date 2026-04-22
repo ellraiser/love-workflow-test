@@ -1,0 +1,33 @@
+name: Auto Close PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+jobs:
+  check_pr:
+    name: Check PR
+    runs-on: ubuntu-latest
+    env:
+      username: 'ellraiser'
+    if: |
+      github.actor == '$username' ||
+      github.event_name == 'pull_request' && github.event.requested_reviewer.login == '$username' ||
+      github.event_name == 'pull_request_review' && github.event.review.user.login == '$username'
+    steps:
+      - name: Close PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: 'This pull request is being automatically closed because we do not accept Copilot contributions or reviews on this repository.'
+            });
+
+            await github.rest.pulls.update({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              state: 'closed'
+            });
