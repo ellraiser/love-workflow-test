@@ -9,11 +9,11 @@ jobs:
     name: Check PR
     runs-on: ubuntu-latest
     env:
-      username: 'ellraiser'
+      username: 'github-copilot'
     if: |
       github.actor == '$username' ||
-      github.event_name == 'pull_request' && github.event.requested_reviewer.login == '$username' ||
-      github.event_name == 'pull_request_review' && github.event.review.user.login == '$username'
+      github.event_name == 'pull_request' && github.event.requested_reviewer && github.event.requested_reviewer.login == '$username' ||
+      github.event_name == 'pull_request_review' && github.event.review && github.event.review.user.login == '$username'
     steps:
       - name: Close PR
         uses: actions/github-script@v7
