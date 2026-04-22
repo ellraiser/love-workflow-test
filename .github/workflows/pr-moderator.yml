@@ -1,4 +1,4 @@
-name: Auto Close PRs
+name: pr-moderator
 
 on:
   pull_request_target:
