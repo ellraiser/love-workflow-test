@@ -29,6 +29,8 @@
 #include "image/Image.h"
 #include "common/memory.h"
 
+#include <tuple>
+
 #import <QuartzCore/CAMetalLayer.h>
 
 #ifdef LOVE_MACOS
@@ -239,9 +241,10 @@ static inline void setSampler(id<MTLComputeCommandEncoder> encoder, Graphics::Re
 	}
 }
 
-love::graphics::Graphics *createInstance()
+std::tuple<love::graphics::Graphics *, std::string> createInstance()
 {
 	love::graphics::Graphics *instance = nullptr;
+	std::string err;
 
 	try
 	{
@@ -249,10 +252,10 @@ love::graphics::Graphics *createInstance()
 	}
 	catch (love::Exception &e)
 	{
-		printf("Cannot create Metal renderer: %s\n", e.what());
+		err = "Cannot create Metal renderer: " + std::string(e.what()) + "\n";
 	}
 
-	return instance;
+	return { instance, err };
 }
 
 struct DefaultVertexAttributes
@@ -278,7 +281,6 @@ Graphics::Graphics()
 	, lastCullMode(CULL_MAX_ENUM)
 	, lastRenderPipelineKey()
 	, shaderSwitches(0)
-	, requestedBackbufferMSAA(0)
 	, attachmentStoreActions()
 	, renderBindings()
 	, uniformBufferOffset(0)
@@ -287,31 +289,24 @@ Graphics::Graphics()
 	, families()
 	, isVMDevice(false)
 { @autoreleasepool {
-	if (@available(macOS 10.15, iOS 13.0, *))
-	{
-		graphicsInstance = this;
+	graphicsInstance = this;
 #ifdef LOVE_MACOS
-		if (isLowPowerPreferred())
+	if (isLowPowerPreferred())
+	{
+		for (id<MTLDevice> dev in MTLCopyAllDevices())
 		{
-			for (id<MTLDevice> dev in MTLCopyAllDevices())
+			if (dev.isLowPower)
 			{
-				if (dev.isLowPower)
-				{
-					device = dev;
-					break;
-				}
+				device = dev;
+				break;
 			}
 		}
+	}
 #endif
-		if (device == nil)
-			device = MTLCreateSystemDefaultDevice();
-		if (device == nil)
-			throw love::Exception("Metal is not supported on this system.");
-	}
-	else
-	{
-		throw love::Exception("LOVE's Metal graphics backend requires macOS 10.15+ or iOS 13+.");
-	}
+	if (device == nil)
+		device = MTLCreateSystemDefaultDevice();
+	if (device == nil)
+		throw love::Exception("Metal is not supported on this system.");
 
 	isVMDevice = [device.name containsString:@("Apple Paravirtual device")];
 
@@ -486,22 +481,15 @@ love::graphics::GraphicsReadback *Graphics::newReadbackInternal(ReadbackMethod m
 	return new GraphicsReadback(this, method, texture, slice, mipmap, rect, dest, destx, desty);
 }
 
-void Graphics::backbufferChanged(int width, int height, int pixelwidth, int pixelheight, bool backbufferstencil, bool backbufferdepth, int msaa)
+void Graphics::backbufferChanged(const BackbufferSettings &settings)
 {
-	bool sizechanged = width != this->width || height != this->height
-		|| pixelwidth != this->pixelWidth || pixelheight != this->pixelHeight;
+	bool sizechanged = settings.width != backbufferSettings.width || settings.height != backbufferSettings.height
+		|| settings.pixelWidth != backbufferSettings.pixelWidth || settings.pixelHeight != backbufferSettings.pixelHeight;
 
-	bool dschanged = backbufferstencil != this->backbufferHasStencil || backbufferdepth != this->backbufferHasDepth;
-	bool msaachanged = msaa != this->requestedBackbufferMSAA;
+	bool dschanged = settings.stencil != backbufferSettings.stencil || settings.depth != backbufferSettings.depth;
+	bool msaachanged = settings.msaa != backbufferSettings.msaa;
 
-	this->width = width;
-	this->height = height;
-	this->pixelWidth = pixelwidth;
-	this->pixelHeight = pixelheight;
-
-	this->backbufferHasStencil = backbufferstencil;
-	this->backbufferHasDepth = backbufferdepth;
-	this->requestedBackbufferMSAA = msaa;
+	backbufferSettings = settings;
 
 	if (!isRenderTargetActive())
 	{
@@ -509,44 +497,42 @@ void Graphics::backbufferChanged(int width, int height, int pixelwidth, int pixe
 		resetProjection();
 	}
 
-	Texture::Settings settings;
-	settings.width = width;
-	settings.height = height;
-	settings.dpiScale = (float)pixelheight / (float)height;
-	settings.msaa = getRequestedBackbufferMSAA();
-	settings.renderTarget = true;
-	settings.readable.set(false);
+	Texture::Settings ts;
+	ts.width = settings.width;
+	ts.height = settings.height;
+	ts.dpiScale = (float)settings.pixelHeight / (float)settings.height;
+	ts.msaa = getRequestedBackbufferMSAA();
+	ts.renderTarget = true;
+	ts.readable.set(false);
 
 	if (sizechanged || msaachanged)
 	{
 		backbufferMSAA.set(nullptr);
-		if (settings.msaa > 1)
+		if (ts.msaa > 1)
 		{
-			settings.format = isGammaCorrect() ? PIXELFORMAT_BGRA8_sRGB : PIXELFORMAT_BGRA8_UNORM;
-			backbufferMSAA.set(newTexture(settings), Acquire::NORETAIN);
+			ts.format = isGammaCorrect() ? PIXELFORMAT_BGRA8_sRGB : PIXELFORMAT_BGRA8_UNORM;
+			backbufferMSAA.set(newTexture(ts), Acquire::NORETAIN);
 		}
 	}
 
 	if (sizechanged || msaachanged || dschanged)
 	{
 		backbufferDepthStencil.set(nullptr);
-		if (backbufferstencil || backbufferdepth)
+		if (settings.stencil || settings.depth)
 		{
-			if (backbufferstencil && backbufferdepth)
-				settings.format = PIXELFORMAT_DEPTH24_UNORM_STENCIL8;
-			else if (backbufferstencil)
-				settings.format = PIXELFORMAT_STENCIL8;
-			else if (backbufferdepth)
-				settings.format = PIXELFORMAT_DEPTH24_UNORM;
-			backbufferDepthStencil.set(newTexture(settings), Acquire::NORETAIN);
+			if (settings.stencil && settings.depth)
+				ts.format = PIXELFORMAT_DEPTH24_UNORM_STENCIL8;
+			else if (settings.stencil)
+				ts.format = PIXELFORMAT_STENCIL8;
+			else if (settings.depth)
+				ts.format = PIXELFORMAT_DEPTH24_UNORM;
+			backbufferDepthStencil.set(newTexture(ts), Acquire::NORETAIN);
 		}
 	}
 }
 
-bool Graphics::setMode(void *context, int width, int height, int pixelwidth, int pixelheight, bool backbufferstencil, bool backbufferdepth, int msaa)
+bool Graphics::setMode(void *context, const BackbufferSettings &settings)
 { @autoreleasepool {
-	this->width = width;
-	this->height = height;
 	this->metalLayer = (__bridge CAMetalLayer *) context;
 
 	metalLayer.device = device;
@@ -560,7 +546,7 @@ bool Graphics::setMode(void *context, int width, int height, int pixelwidth, int
 	metalLayer.magnificationFilter = kCAFilterNearest;
 #endif
 
-	backbufferChanged(width, height, pixelwidth, pixelheight, backbufferstencil, backbufferdepth, msaa);
+	backbufferChanged(settings);
 
 	created = true;
 
@@ -971,10 +957,10 @@ void Graphics::applyRenderState(id<MTLRenderCommandEncoder> encoder, VertexAttri
 		if (state.scissor)
 		{
 			double dpiscale = getCurrentDPIScale();
-			rect.x = (NSUInteger)(state.scissorRect.x*dpiscale);
-			rect.y = (NSUInteger)(state.scissorRect.y*dpiscale);
-			rect.width = (NSUInteger)(state.scissorRect.w*dpiscale);
-			rect.height = (NSUInteger)(state.scissorRect.h*dpiscale);
+			rect.x = (NSUInteger)roundf(state.scissorRect.x*dpiscale);
+			rect.y = (NSUInteger)roundf(state.scissorRect.y*dpiscale);
+			rect.width = (NSUInteger)roundf(state.scissorRect.w*dpiscale);
+			rect.height = (NSUInteger)roundf(state.scissorRect.h*dpiscale);
 
 			if (rtw > 0 && (int)rect.x >= rtw)
 				rect.x = rtw - 1;
@@ -1119,7 +1105,7 @@ bool Graphics::applyShaderUniforms(id<MTLComputeCommandEncoder> encoder, love::g
 	return allWritableVariablesSet;
 }
 
-void Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, love::graphics::Shader *shader, love::graphics::Texture *maintex)
+bool Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, love::graphics::Shader *shader, love::graphics::Texture *maintex)
 {
 	Shader *s = (Shader *)shader;
 
@@ -1182,6 +1168,8 @@ void Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, lo
 
 	uniformBufferOffset += alignUp(size, alignment);
 
+	bool allWritableVariablesSet = true;
+
 	for (const Shader::TextureBinding &b : s->getTextureBindings())
 	{
 		id<MTLTexture> texture = b.texture;
@@ -1197,7 +1185,13 @@ void Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, lo
 		uint8 sampindex = b.samplerStages[SHADERSTAGE_VERTEX];
 
 		if (texindex != LOVE_UINT8_MAX)
+		{
 			setTexture(renderEncoder, bindings, SHADERSTAGE_VERTEX, texindex, texture);
+
+			if ((b.access & Shader::ACCESS_WRITE) != 0 && texture == nil)
+				allWritableVariablesSet = false;
+		}
+
 		if (sampindex != LOVE_UINT8_MAX)
 			setSampler(renderEncoder, bindings, SHADERSTAGE_VERTEX, sampindex, samplertex);
 
@@ -1205,7 +1199,13 @@ void Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, lo
 		sampindex = b.samplerStages[SHADERSTAGE_PIXEL];
 
 		if (texindex != LOVE_UINT8_MAX)
+		{
 			setTexture(renderEncoder, bindings, SHADERSTAGE_PIXEL, texindex, texture);
+
+			if ((b.access & Shader::ACCESS_WRITE) != 0 && texture == nil)
+				allWritableVariablesSet = false;
+		}
+
 		if (sampindex != LOVE_UINT8_MAX)
 			setSampler(renderEncoder, bindings, SHADERSTAGE_PIXEL, sampindex, samplertex);
 	}
@@ -1214,11 +1214,24 @@ void Graphics::applyShaderUniforms(id<MTLRenderCommandEncoder> renderEncoder, lo
 	{
 		uint8 index = b.stages[SHADERSTAGE_VERTEX];
 		if (index != LOVE_UINT8_MAX)
+		{
 			setBuffer(renderEncoder, bindings, SHADERSTAGE_VERTEX, index, b.buffer, 0);
+
+			if ((b.access & Shader::ACCESS_WRITE) != 0 && b.buffer == nil)
+				allWritableVariablesSet = false;
+		}
+
 		index = b.stages[SHADERSTAGE_PIXEL];
 		if (index != LOVE_UINT8_MAX)
+		{
 			setBuffer(renderEncoder, bindings, SHADERSTAGE_PIXEL, index, b.buffer, 0);
+
+			if ((b.access & Shader::ACCESS_WRITE) != 0 && b.buffer == nil)
+				allWritableVariablesSet = false;
+		}
 	}
+
+	return allWritableVariablesSet;
 }
 
 static void setVertexBuffers(id<MTLRenderCommandEncoder> encoder, love::graphics::Shader *shader, const BufferBindings *buffers, Graphics::RenderEncoderBindings &bindings)
@@ -1254,7 +1267,8 @@ void Graphics::draw(const DrawCommand &cmd)
 	}
 
 	applyRenderState(encoder, cmd.attributesID);
-	applyShaderUniforms(encoder, Shader::current, cmd.texture);
+	if (!applyShaderUniforms(encoder, Shader::current, cmd.texture))
+		return;
 
 	setVertexBuffers(encoder, Shader::current, cmd.buffers, renderBindings);
 
@@ -1286,7 +1300,8 @@ void Graphics::draw(const DrawIndexedCommand &cmd)
 	}
 
 	applyRenderState(encoder, cmd.attributesID);
-	applyShaderUniforms(encoder, Shader::current, cmd.texture);
+	if (!applyShaderUniforms(encoder, Shader::current, cmd.texture))
+		return;
 
 	setVertexBuffers(encoder, Shader::current, cmd.buffers, renderBindings);
 
@@ -1351,7 +1366,8 @@ void Graphics::drawQuads(int start, int count, VertexAttributesID attributesID, 
 	}
 
 	applyRenderState(encoder, attributesID);
-	applyShaderUniforms(encoder, Shader::current, texture);
+	if (!applyShaderUniforms(encoder, Shader::current, texture))
+		return;
 
 	id<MTLBuffer> ib = getMTLBuffer(quadIndexBuffer);
 
@@ -1542,6 +1558,8 @@ void Graphics::endPass(bool presenting)
 
 void Graphics::clear(OptionalColorD c, OptionalInt stencil, OptionalDouble depth)
 { @autoreleasepool {
+	bool activateRenderEncoder = false;
+
 	if (c.hasValue || stencil.hasValue || depth.hasValue)
 	{
 		flushBatchedDraws();
@@ -1550,7 +1568,7 @@ void Graphics::clear(OptionalColorD c, OptionalInt stencil, OptionalDouble depth
 		if (renderEncoder != nil)
 		{
 			submitRenderEncoder(SUBMIT_STORE);
-			useRenderEncoder();
+			activateRenderEncoder = true;
 		}
 	}
 
@@ -1577,12 +1595,17 @@ void Graphics::clear(OptionalColorD c, OptionalInt stencil, OptionalDouble depth
 		passDesc.depthAttachment.clearDepth = depth.value;
 		passDesc.depthAttachment.loadAction = MTLLoadActionClear;
 	}
+
+	if (activateRenderEncoder)
+		useRenderEncoder();
 }}
 
 void Graphics::clear(const std::vector<OptionalColorD> &colors, OptionalInt stencil, OptionalDouble depth)
 { @autoreleasepool {
 	if (colors.size() == 0 && !stencil.hasValue && !depth.hasValue)
 		return;
+
+	bool activateRenderEncoder = false;
 
 	int ncolorcanvases = (int) states.back().renderTargets.colors.size();
 	int ncolors = (int) colors.size();
@@ -1599,7 +1622,7 @@ void Graphics::clear(const std::vector<OptionalColorD> &colors, OptionalInt sten
 	if (renderEncoder != nil)
 	{
 		submitRenderEncoder(SUBMIT_STORE);
-		useRenderEncoder();
+		activateRenderEncoder = true;
 	}
 
 	for (int i = 0; i < ncolors; i++)
@@ -1626,6 +1649,9 @@ void Graphics::clear(const std::vector<OptionalColorD> &colors, OptionalInt sten
 		passDesc.depthAttachment.clearDepth = depth.value;
 		passDesc.depthAttachment.loadAction = MTLLoadActionClear;
 	}
+
+	if (activateRenderEncoder)
+		useRenderEncoder();
 }}
 
 void Graphics::discard(const std::vector<bool> &colorbuffers, bool depthstencil)
@@ -1776,11 +1802,6 @@ void Graphics::present(void *screenshotCallbackData)
 	processCompletedCommandBuffers();
 }}
 
-int Graphics::getRequestedBackbufferMSAA() const
-{
-	return requestedBackbufferMSAA;
-}
-
 int Graphics::getBackbufferMSAA() const
 {
 	return backbufferMSAA.get() ? backbufferMSAA->getMSAA() : 0;
@@ -1796,7 +1817,7 @@ void Graphics::setColor(Colorf c)
 	states.back().color = c;
 }
 
-void Graphics::setScissor(const Rect &rect)
+void Graphics::setScissor(const FRect &rect)
 {
 	flushBatchedDraws();
 
@@ -1947,16 +1968,12 @@ bool Graphics::isPixelFormatSupported(PixelFormat format, uint32 usage)
 			flags |= all;
 			break;
 		case PIXELFORMAT_LA8_UNORM:
-			// Requires texture swizzle support.
-			if (@available(macOS 10.15, iOS 13, *))
+			// As of early 2024, the VM device doesn't properly support texture swizzles
+			// (observed on GitHub's runners) which is required for LA8 support.
+			if (!isVMDevice)
 			{
-				// As of early 2024, the VM device doesn't properly support texture swizzles
-				// (observed on GitHub's runners) which is required for LA8 support.
-				if (!isVMDevice)
-				{
-					if (families.apple[1] || families.mac[2] || families.macCatalyst[2])
-						flags |= commonsample;
-				}
+				if (families.apple[1] || families.mac[2] || families.macCatalyst[2])
+					flags |= commonsample;
 			}
 			break;
 		case PIXELFORMAT_RG16_UNORM:
@@ -2035,8 +2052,14 @@ bool Graphics::isPixelFormatSupported(PixelFormat format, uint32 usage)
 		case PIXELFORMAT_RG32_UINT:
 		case PIXELFORMAT_RGBA32_INT:
 		case PIXELFORMAT_RGBA32_UINT:
+		case PIXELFORMAT_RGB10A2_UINT:
 			// If MSAA support for int formats is added this should be split up.
 			flags |= sample | rt | computewrite;
+			if (format == PIXELFORMAT_R32_INT || format == PIXELFORMAT_R32_UINT)
+			{
+				if (@available(macOS 14.0, iOS 17.0, *))
+					flags |= PIXELFORMATUSAGEFLAGS_SHADERATOMICS;
+			}
 			break;
 
 		case PIXELFORMAT_RGBA4_UNORM:
@@ -2211,35 +2234,32 @@ int Graphics::getClosestMSAASamples(int requestedsamples)
 
 void Graphics::initCapabilities()
 {
-	if (@available(macOS 10.15, iOS 13.0, *))
+	for (NSInteger i = 0; i < 7; i++)
 	{
-		for (NSInteger i = 0; i < 7; i++)
-		{
-			MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyApple1 + i);
-			if ([device supportsFamily:family])
-				families.apple[1 + i] = true;
-		}
+		MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyApple1 + i);
+		if ([device supportsFamily:family])
+			families.apple[1 + i] = true;
+	}
 
-		for (NSInteger i = 0; i < 2; i++)
-		{
-			MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyMac1 + i);
-			if ([device supportsFamily:family])
-				families.mac[1 + i] = true;
-		}
+	for (NSInteger i = 0; i < 2; i++)
+	{
+		MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyMac1 + i);
+		if ([device supportsFamily:family])
+			families.mac[1 + i] = true;
+	}
 
-		for (NSInteger i = 0; i < 3; i++)
-		{
-			MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyCommon1 + i);
-			if ([device supportsFamily:family])
-				families.common[1 + i] = true;
-		}
+	for (NSInteger i = 0; i < 3; i++)
+	{
+		MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyCommon1 + i);
+		if ([device supportsFamily:family])
+			families.common[1 + i] = true;
+	}
 
-		for (NSInteger i = 0; i < 2; i++)
-		{
-			MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyMacCatalyst1 + i);
-			if ([device supportsFamily:family])
-				families.macCatalyst[1 + i] = true;
-		}
+	for (NSInteger i = 0; i < 2; i++)
+	{
+		MTLGPUFamily family = (MTLGPUFamily) (MTLGPUFamilyMacCatalyst1 + i);
+		if ([device supportsFamily:family])
+			families.macCatalyst[1 + i] = true;
 	}
 
 	capabilities.features[FEATURE_MULTI_RENDER_TARGET_FORMATS] = true;
@@ -2265,8 +2285,21 @@ void Graphics::initCapabilities()
 		capabilities.features[FEATURE_INDIRECT_DRAW] = true;
 	else
 		capabilities.features[FEATURE_INDIRECT_DRAW] = false;
+
+	// Apple 3 devices support read/write to buffers in functions, while Apple 4 supports read/write to images.
+	// So let's err on the safe side and check support for Apple 4.
+	if (families.apple[4])
+	{
+		capabilities.features[FEATURE_VERTEX_WRITE] = true;
+		capabilities.features[FEATURE_PIXEL_WRITE] = true;
+	}
+	else
+	{
+		capabilities.features[FEATURE_VERTEX_WRITE] = false;
+		capabilities.features[FEATURE_PIXEL_WRITE] = false;
+	}
 	
-	static_assert(FEATURE_MAX_ENUM == 13, "Graphics::initCapabilities must be updated when adding a new graphics feature!");
+	static_assert(FEATURE_MAX_ENUM == 15, "Graphics::initCapabilities must be updated when adding a new graphics feature!");
 
 	// https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
 	capabilities.limits[LIMIT_POINT_SIZE] = 511;

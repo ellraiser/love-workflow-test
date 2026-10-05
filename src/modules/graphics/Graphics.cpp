@@ -36,6 +36,7 @@
 
 // C++
 #include <algorithm>
+#include <tuple>
 #include <stdlib.h>
 
 namespace love
@@ -106,19 +107,18 @@ bool isDebugEnabled()
 
 love::Type Graphics::type("graphics", &Module::type);
 
-namespace opengl { extern love::graphics::Graphics *createInstance(); }
+namespace opengl { extern std::tuple<love::graphics::Graphics *, std::string> createInstance(); }
 #ifdef LOVE_GRAPHICS_METAL
-namespace metal { extern love::graphics::Graphics *createInstance(); }
+namespace metal { extern std::tuple<love::graphics::Graphics *, std::string> createInstance(); }
 #endif
 #ifdef LOVE_GRAPHICS_VULKAN
-namespace vulkan { extern love::graphics::Graphics *createInstance(); }
+namespace vulkan { extern std::tuple<love::graphics::Graphics *, std::string> createInstance(); }
 #endif
 
 static const Renderer rendererOrder[] = {
 	RENDERER_METAL,
-#if defined(LOVE_ANDROID) || (defined(LOVE_WINDOWS) && defined(_M_ARM64))
-	// Don't prioritize Vulkan by default yet on Android - it needs more testing.
-	// Also don't prioritize Vulkan on Windows ARM64 because it doesn't work.
+#if defined(LOVE_WINDOWS) && defined(_M_ARM64)
+	// Don't prioritize Vulkan on Windows ARM64 because it doesn't work.
 	// See https://github.com/love2d/love/issues/2196
 	RENDERER_OPENGL,
 	RENDERER_VULKAN,
@@ -165,6 +165,7 @@ bool isLowPowerPreferred()
 Graphics *Graphics::createInstance()
 {
 	Graphics *instance = Module::getInstance<Graphics>(M_GRAPHICS);
+	std::string errors;
 
 	if (instance != nullptr)
 		instance->retain();
@@ -172,23 +173,37 @@ Graphics *Graphics::createInstance()
 	{
 		for (auto r : rendererOrder)
 		{
-
 			if (std::find(_renderers.begin(), _renderers.end(), r) == _renderers.end())
 				continue;
 
+			std::string err;
+
 #ifdef LOVE_GRAPHICS_VULKAN
 			if (r == RENDERER_VULKAN)
-				instance = vulkan::createInstance();
+				std::tie(instance, err) = vulkan::createInstance();
 #endif
 			if (r == RENDERER_OPENGL)
-				instance = opengl::createInstance();
+				std::tie(instance, err) = opengl::createInstance();
 #ifdef LOVE_GRAPHICS_METAL
 			if (r == RENDERER_METAL)
-				instance = metal::createInstance();
+				std::tie(instance, err) = metal::createInstance();
 #endif
+
+			if (!err.empty())
+			{
+				errors += err;
+				if (isDebugEnabled())
+					::printf("%s", err.c_str());
+			}
+
 			if (instance != nullptr)
 				break;
 		}
+	}
+
+	if (instance == nullptr)
+	{
+		throw love::Exception("Cannot create graphics: no supported renderer on this system.\n%s", errors.c_str());
 	}
 
 	return instance;
@@ -201,12 +216,7 @@ Graphics::DisplayState::DisplayState()
 
 Graphics::Graphics(const char *name)
 	: Module(M_GRAPHICS, name)
-	, width(0)
-	, height(0)
-	, pixelWidth(0)
-	, pixelHeight(0)
-	, backbufferHasStencil(false)
-	, backbufferHasDepth(false)
+	, backbufferSettings()
 	, created(false)
 	, active(true)
 	, batchedDrawState()
@@ -556,7 +566,7 @@ bool Graphics::validateShader(bool gles, const std::vector<std::string> &stagess
 		}
 	}
 
-	return Shader::validate(stages, err);
+	return Shader::validate(stages, err, options);
 }
 
 Texture *Graphics::getDefaultTexture(TextureType type, DataBaseType dataType, bool depthSample)
@@ -736,7 +746,7 @@ void Graphics::validateStencilState(const StencilState &s) const
 		const auto &rts = states.back().renderTargets;
 		love::graphics::Texture *dstexture = rts.depthStencil.texture.get();
 
-		if (!isRenderTargetActive() && !backbufferHasStencil)
+		if (!isRenderTargetActive() && !backbufferSettings.stencil)
 			throw love::Exception("The window must have stenciling enabled to draw to the main screen's stencil buffer.");
 		else if (isRenderTargetActive() && (rts.temporaryRTFlags & TEMPORARY_RT_STENCIL) == 0 && (dstexture == nullptr || !isPixelFormatStencil(dstexture->getPixelFormat())))
 			throw love::Exception("Drawing to the stencil buffer with a Canvas active requires either stencil=true or a custom stencil-type Canvas to be used, in setCanvas.");
@@ -750,7 +760,7 @@ void Graphics::validateDepthState(bool depthwrite) const
 		const auto &rts = states.back().renderTargets;
 		love::graphics::Texture *dstexture = rts.depthStencil.texture.get();
 
-		if (!isRenderTargetActive() && !backbufferHasDepth)
+		if (!isRenderTargetActive() && !backbufferSettings.depth)
 			throw love::Exception("The window must have depth enabled to draw to the main screen's depth buffer.");
 		else if (isRenderTargetActive() && (rts.temporaryRTFlags & TEMPORARY_RT_DEPTH) == 0 && (dstexture == nullptr || !isPixelFormatDepth(dstexture->getPixelFormat())))
 			throw love::Exception("Drawing to the depth buffer with a Canvas active requires either depth=true or a custom depth-type Canvas to be used, in setCanvas.");
@@ -759,22 +769,22 @@ void Graphics::validateDepthState(bool depthwrite) const
 
 int Graphics::getWidth() const
 {
-	return width;
+	return backbufferSettings.width;
 }
 
 int Graphics::getHeight() const
 {
-	return height;
+	return backbufferSettings.height;
 }
 
 int Graphics::getPixelWidth() const
 {
-	return pixelWidth;
+	return backbufferSettings.pixelWidth;
 }
 
 int Graphics::getPixelHeight() const
 {
-	return pixelHeight;
+	return backbufferSettings.pixelHeight;
 }
 
 double Graphics::getCurrentDPIScale() const
@@ -789,6 +799,11 @@ double Graphics::getCurrentDPIScale() const
 double Graphics::getScreenDPIScale() const
 {
 	return (double) getPixelHeight() / (double) getHeight();
+}
+
+int Graphics::getRequestedBackbufferMSAA() const
+{
+	return backbufferSettings.msaa;
 }
 
 bool Graphics::isCreated() const
@@ -813,7 +828,12 @@ void Graphics::reset()
 
 void Graphics::backbufferChanged(int width, int height, int pixelwidth, int pixelheight)
 {
-	backbufferChanged(width, height, pixelwidth, pixelheight, backbufferHasStencil, backbufferHasDepth, getRequestedBackbufferMSAA());
+	BackbufferSettings s = backbufferSettings;
+	s.width = width;
+	s.height = height;
+	s.pixelWidth = pixelwidth;
+	s.pixelHeight = pixelheight;
+	backbufferChanged(s);
 }
 
 /**
@@ -1235,7 +1255,7 @@ void Graphics::setRenderTarget()
 	const RenderTargetsStrongRef prevRTs = state.renderTargets;
 
 	flushBatchedDraws();
-	setRenderTargetsInternal(RenderTargets(), pixelWidth, pixelHeight, isGammaCorrect());
+	setRenderTargetsInternal(RenderTargets(), backbufferSettings.pixelWidth, backbufferSettings.pixelHeight, isGammaCorrect());
 
 	state.renderTargets = RenderTargetsStrongRef();
 	renderTargetSwitchCount++;
@@ -1484,9 +1504,9 @@ bool Graphics::findVertexAttributes(VertexAttributesID id, VertexAttributes &att
 	return true;
 }
 
-void Graphics::intersectScissor(const Rect &rect)
+void Graphics::intersectScissor(const FRect &rect)
 {
-	Rect currect = states.back().scissorRect;
+	FRect currect = states.back().scissorRect;
 
 	if (!states.back().scissor)
 	{
@@ -1496,17 +1516,17 @@ void Graphics::intersectScissor(const Rect &rect)
 		currect.h = std::numeric_limits<int>::max();
 	}
 
-	int x1 = std::max(currect.x, rect.x);
-	int y1 = std::max(currect.y, rect.y);
+	float x1 = std::max(currect.x, rect.x);
+	float y1 = std::max(currect.y, rect.y);
 
-	int x2 = std::min(currect.x + currect.w, rect.x + rect.w);
-	int y2 = std::min(currect.y + currect.h, rect.y + rect.h);
+	float x2 = std::min(currect.x + currect.w, rect.x + rect.w);
+	float y2 = std::min(currect.y + currect.h, rect.y + rect.h);
 
-	Rect newrect = {x1, y1, std::max(0, x2 - x1), std::max(0, y2 - y1)};
+	FRect newrect = {x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1)};
 	setScissor(newrect);
 }
 
-bool Graphics::getScissor(Rect &rect) const
+bool Graphics::getScissor(FRect &rect) const
 {
 	const DisplayState &state = states.back();
 	rect = state.scissorRect;
@@ -2968,6 +2988,8 @@ STRINGMAP_CLASS_BEGIN(Graphics, Graphics::Feature, Graphics::FEATURE_MAX_ENUM, f
 	{ "texelbuffer",              Graphics::FEATURE_TEXEL_BUFFER         },
 	{ "copytexturetobuffer",      Graphics::FEATURE_COPY_TEXTURE_TO_BUFFER },
 	{ "indirectdraw",             Graphics::FEATURE_INDIRECT_DRAW        },
+	{ "vertexwrite",              Graphics::FEATURE_VERTEX_WRITE         },
+	{ "pixelwrite",               Graphics::FEATURE_PIXEL_WRITE          },
 }
 STRINGMAP_CLASS_END(Graphics, Graphics::Feature, Graphics::FEATURE_MAX_ENUM, feature)
 

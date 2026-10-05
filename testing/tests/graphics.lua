@@ -1003,6 +1003,90 @@ love.test.graphics.Shader = function(test)
   else
     test:assertTrue(true, "skip shader IO test")
   end
+
+  if love.graphics.getSupported().glsl4 and love.graphics.getSupported().vertexwrite and love.graphics.getSupported().pixelwrite then
+    local name = love.graphics.getRendererInfo()
+    local isGLES = name:match("OpenGL ES") ~= nil
+
+    local success, message = love.graphics.validateShader(isGLES, [[
+      #pragma language glsl4
+
+      #ifdef PIXEL
+      buffer ColorBuffer
+      {
+        vec4 colors[];
+      };
+
+      void effect()
+      {
+        colors[0] = VaryingColor;
+        love_PixelColor = colors[0];
+      }
+      #endif
+
+      #ifdef VERTEX
+      vec4 position(mat4 m, vec4 p)
+      {
+        return m * p;
+      }
+      #endif
+    ]])
+
+    test:assertFalse(success, "shader should not validate (SSBO)")
+    test:assertEquals("Shader validation error:\nStorage Buffer block 'ColorBuffer' must be marked as readonly in vertex and pixel shaders unless explicitly enabled.", message)
+
+    success, message = love.graphics.validateShader(isGLES, [[
+      #pragma language glsl4
+
+      buffer ColorBuffer
+      {
+        vec4 colors[];
+      };
+
+      void effect()
+      {
+        colors[0] = VaryingColor;
+        love_PixelColor = colors[0];
+      }
+    ]], { write = true })
+
+    test:assertTrue(success, "shader should validate (SSBO)")
+    test:assertEquals(nil, message)
+
+    success, message = love.graphics.validateShader(isGLES, [[
+        #pragma language glsl4
+
+        layout(rgba32f) uniform readonly highp image2D RGBAImage;
+
+        void effect()
+        {
+          love_PixelColor = VaryingColor * imageLoad(RGBAImage, ivec2(gl_FragCoord.xy));
+        }
+    ]])
+      
+    test:assertFalse(success, "shader should not validate (image)")
+    test:assertEquals("Shader validation error:\nStorage Texture uniform variables (image2D, etc) are only allowed in compute shaders unless explicitly enabled.", message)
+    
+    success, message = love.graphics.validateShader(isGLES, [[
+      #pragma language glsl4
+
+      #ifdef GL_ES
+        precision highp float;
+      #endif
+
+      layout(rgba32f) uniform readonly highp image2D RGBAImage;
+
+      void effect()
+      {
+        love_PixelColor = VaryingColor * imageLoad(RGBAImage, ivec2(gl_FragCoord.xy));
+      }
+    ]], { write = true })
+
+    test:assertTrue(success, "shader should validate (image)")
+    test:assertEquals(nil, message)
+  else
+    test:assertTrue(true, "skip feature test")
+  end
 end
 
 
@@ -2668,6 +2752,31 @@ love.test.graphics.translate = function(test)
     love.graphics.translate(0, -5)
     love.graphics.rectangle('fill', 0, 0, 1, 1)
     love.graphics.setColor(1, 1, 1, 1)
+  love.graphics.setCanvas()
+  local imgdata = love.graphics.readbackTexture(canvas)
+  test:compareImg(imgdata)
+end
+
+
+-- love.graphics.resetProjection
+love.test.graphics.resetProjection = function(test)
+  local canvas = love.graphics.newCanvas(16, 16)
+  love.graphics.setCanvas(canvas)
+    love.graphics.clear(0, 0, 0, 1)
+    love.graphics.origin()
+    -- draw red pixel at (0, 4) using default projection
+    love.graphics.setColor(1, 0, 0, 1)
+    love.graphics.rectangle('fill', 0, 4, 1, 1)
+    love.graphics.setProjection("row", 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)
+    -- draw a green pixel at that should not show on screen after projection.
+    -- if setProjection doesn't affect it, the green pixel will show and fail
+    -- the test.
+    love.graphics.setColor(0, 1, 0, 1)
+    love.graphics.rectangle('fill', 2, 2, 1, 1)
+    -- draw a blue pixel at (8, 8) after resetting projection
+    love.graphics.resetProjection()
+    love.graphics.setColor(0, 0, 1, 1)
+    love.graphics.rectangle('fill', 8, 8, 1, 1)
   love.graphics.setCanvas()
   local imgdata = love.graphics.readbackTexture(canvas)
   test:compareImg(imgdata)

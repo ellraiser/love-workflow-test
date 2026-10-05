@@ -154,6 +154,9 @@ struct OptionalInstanceExtensions
 
 	// VK_EXT_debug_info
 	bool debugInfo = false;
+
+	// VK_KHR_get_surface_capabilities2
+	bool surfaceCapabilities2 = false;
 };
 
 struct OptionalDeviceExtensions
@@ -175,6 +178,15 @@ struct OptionalDeviceExtensions
 
 	// VK_KHR_spirv_1_4
 	bool spirv14 = false;
+
+	// VK_EXT_full_screen_exclusive
+	bool fullscreenExclusive = false;
+};
+
+struct OptionalDeviceFeatures
+{
+	bool fillModeNonSolid = false;
+	bool samplerAnisotropy = false;
 };
 
 struct QueueFamilyIndices
@@ -240,14 +252,13 @@ public:
 	void clear(const std::vector<OptionalColorD> &colors, OptionalInt stencil, OptionalDouble depth) override;
 	void discard(const std::vector<bool>& colorbuffers, bool depthstencil) override;
 	void present(void *screenshotCallbackdata) override;
-	void backbufferChanged(int width, int height, int pixelwidth, int pixelheight, bool backbufferstencil, bool backbufferdepth, int msaa) override;
-	bool setMode(void *context, int width, int height, int pixelwidth, int pixelheight, bool backbufferstencil, bool backbufferdepth, int msaa) override;
+	void backbufferChanged(const BackbufferSettings &settings) override;
+	bool setMode(void *context, const BackbufferSettings &settings) override;
 	void unSetMode() override;
 	void setActive(bool active) override;
-	int getRequestedBackbufferMSAA() const override;
 	int getBackbufferMSAA() const  override;
 	void setColor(Colorf c) override;
-	void setScissor(const Rect &rect) override;
+	void setScissor(const FRect &rect) override;
 	void setScissor() override;
 	void setStencilState(const StencilState &s) override;
 	void setDepthMode(CompareMode compare, bool write) override;
@@ -271,7 +282,7 @@ public:
 	VkCommandBuffer getCommandBufferForDataTransfer();
 	void queueCleanUp(std::function<void()> cleanUp);
 	void addReadbackCallback(std::function<void()> callback);
-	void submitGpuCommands(SubmitMode, void *screenshotCallbackData = nullptr);
+	StrongRef<image::ImageData> submitGpuCommands(SubmitMode);
 	VkSampler getCachedSampler(const SamplerState &sampler);
 	SharedDescriptorPools *acquireDescriptorPools(int dynamicUniformBuffers, int sampledTextures, int storageTextures, int texelBuffers, int storageBuffers);
 	void releaseDescriptorPools(SharedDescriptorPools *pools);
@@ -303,6 +314,13 @@ protected:
 
 private:
 
+	enum SwapChainRequestFlags
+	{
+		SWAP_CHAIN_REQUEST_KEEP = 0,
+		SWAP_CHAIN_REQUEST_RECREATE = (1 << 0),
+		SWAP_CHAIN_REQUEST_RECREATE_SURFACE = (1 << 1),
+	};
+
 	struct SharedDescriptorPoolsRef
 	{
 		SharedDescriptorPools *pools = nullptr;
@@ -317,6 +335,7 @@ private:
 	void createPipelineCache();
 	void initVMA();
 	void createSurface();
+	void cleanupSurface();
 	SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device);
 	VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR> &availableFormats);
 	VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR> &availablePresentModes);
@@ -353,6 +372,8 @@ private:
 		VertexAttributesID attributesID,
 		const BufferBindings &buffers, graphics::Texture *texture,
 		PrimitiveType, CullMode);
+	bool prepareBarrier(VkAccessFlags &dstAccessMask, VkPipelineStageFlags &dstStageMask);
+	void tryBarrier(VkAccessFlags dstAccessMask, VkPipelineStageFlags dstStageMask);
 	void setRenderPass(const RenderTargets &rts, int pixelw, int pixelh);
 	void setDefaultRenderPass();
 	void startRenderPass();
@@ -364,10 +385,10 @@ private:
 	VkInstance instance = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	uint32_t deviceApiVersion = VK_API_VERSION_1_0;
-	int requestedMsaa = 0;
 	VkDevice device = VK_NULL_HANDLE; 
 	OptionalInstanceExtensions optionalInstanceExtensions;
 	OptionalDeviceExtensions optionalDeviceExtensions;
+	OptionalDeviceFeatures optionalDeviceFeatures;
 	VkQueue graphicsQueue = VK_NULL_HANDLE;
 	VkQueue presentQueue = VK_NULL_HANDLE;
 	VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -404,7 +425,8 @@ private:
 	size_t currentFrame = 0;
 	uint32_t imageIndex = 0;
 	uint64 realFrameIndex = 0;
-	bool swapChainRecreationRequested = false;
+	uint32 swapChainRequestFlags = 0;
+	bool windowIsFullscreenExclusive = false;
 	bool transitionColorDepthLayouts = false;
 	VmaAllocator vmaAllocator = VK_NULL_HANDLE;
 	StrongRef<love::graphics::Buffer> defaultVertexBuffer;
