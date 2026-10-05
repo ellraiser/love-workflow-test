@@ -41,7 +41,7 @@ jobs:
     - name: Checkout love-appimage-source
       uses: actions/checkout@v4
       with:
-        repository: love2d/love-appimage-source
+        repository: ellraiser/love-appimage-source
         ref: main
     - name: Checkout LÖVE
       uses: actions/checkout@v4
